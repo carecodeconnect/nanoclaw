@@ -8,7 +8,7 @@
  * Ported from v1 — see v1 source for commit history.
  */
 import { execFileSync, execSync, spawn } from 'node:child_process';
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createConnection, type Socket } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -312,6 +312,29 @@ interface SignalDataMessage {
     filename?: string;
     size?: number;
   }>;
+  reaction?: {
+    emoji?: string;
+    targetAuthor?: string;
+    targetAuthorNumber?: string;
+    targetAuthorUuid?: string;
+    targetSentTimestamp?: number;
+    isRemove?: boolean;
+  };
+}
+
+/**
+ * Signal reactions (tapping an emoji on a message) arrive as a `dataMessage`
+ * / `syncMessage.sentMessage` with an empty `message` and a populated
+ * `reaction` instead — previously fell straight into the same
+ * `if (!text && !hasVoice && !imageAttachments.length) return` guard that
+ * used to drop voice notes, so reactions were silently invisible to the
+ * agent (found 2026-07-31, same class of bug). Formatted as plain text
+ * rather than a structured field so it flows through the existing
+ * text/attachment pipeline unchanged.
+ */
+function formatReactionText(reaction: NonNullable<SignalDataMessage['reaction']>): string {
+  const emoji = reaction.emoji || '?';
+  return reaction.isRemove ? `[Reaction removed: ${emoji}]` : `[Reaction: ${emoji}]`;
 }
 
 interface SignalEnvelope {
@@ -373,15 +396,89 @@ export function computeSignalIsMention(
 
 /**
  * Optional voice-note transcription. Tries (in order):
- *   1. local whisper.cpp CLI when `WHISPER_BIN` is set
- *   2. OpenAI Whisper API when `OPENAI_API_KEY` is set
- * Returns null if neither path is configured or transcription fails — caller
- * falls back to a `[Voice Message]` placeholder.
+ *   1. jobcrawler's own local whisper-rs pipeline, via a direct HTTP call to
+ *      its `/api/admin/voice/transcribe` route, when `JOBCRAWLER_ADMIN_TOKEN`
+ *      is set (the common case on this Pi — jobcrawler and nanoclaw share
+ *      hardware, so this reuses its already-loaded model instead of standing
+ *      up a second one).
+ *   2. local whisper.cpp CLI when `WHISPER_BIN` is set
+ *   3. OpenAI Whisper API when `OPENAI_API_KEY` is set
+ * Returns null if none are configured or all fail — caller falls back to a
+ * `[Voice Message]` placeholder (the agent can still transcribe it itself
+ * via the `transcribe_audio` MCP tool, just slower).
  *
- * Signal voice notes are AAC/ADTS; whisper-cpp wants WAV. ffmpeg is invoked
- * if available to convert; if ffmpeg is missing the local path is skipped.
+ * This runs deterministically at message-delivery time, before the note
+ * ever reaches the agent LLM — deliberately, so a voice note doesn't depend
+ * on the model deciding to call a tool. The alternative (agent reads the
+ * file, base64-encodes it via Bash, and calls `transcribe_audio` itself)
+ * embeds the whole clip as a giant tool-result in the conversation, which is
+ * slow and burns context for a purely mechanical step — found 2026-07-31
+ * watching a real voice note take minutes to process that way.
+ *
+ * Signal voice notes are AAC/ADTS; whisper-cpp (path 2) wants WAV, so ffmpeg
+ * is invoked to convert; if ffmpeg is missing that path is skipped. Path 1
+ * sends the raw bytes as-is — jobcrawler's own ffmpeg-based decode handles
+ * whatever format arrives.
  */
+async function transcribeViaJobcrawler(filePath: string): Promise<string | null> {
+  // process.env is deliberately NOT populated from .env (see env.ts) — must
+  // go through readEnvFile like every other secret read in this file.
+  const envVars = readEnvFile(['JOBCRAWLER_ADMIN_TOKEN', 'JOBCRAWLER_BASE_URL']);
+  const token = envVars.JOBCRAWLER_ADMIN_TOKEN;
+  if (!token) return null;
+  const base = envVars.JOBCRAWLER_BASE_URL || 'http://127.0.0.1:8080';
+  try {
+    const buf = readFileSync(filePath);
+    const res = await fetch(`${base}/api/admin/voice/transcribe`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/octet-stream' },
+      body: buf,
+    });
+    if (!res.ok) {
+      log.debug('Signal: jobcrawler transcription failed', { status: res.status });
+      return null;
+    }
+    const json = (await res.json()) as { transcript?: string };
+    return json.transcript?.trim() || null;
+  } catch (err) {
+    log.debug('Signal: jobcrawler transcription request failed', { err });
+    return null;
+  }
+}
+
+/**
+ * Symmetric counterpart to `transcribeViaJobcrawler` — text in, WAV bytes
+ * out, via jobcrawler's `/api/admin/voice/synthesize`. Returns null (caller
+ * falls back to a plain text reply) if `JOBCRAWLER_ADMIN_TOKEN` isn't
+ * configured or the request fails; a voice-in-voice-out UX feature must
+ * degrade to text, never drop the reply entirely.
+ */
+async function synthesizeViaJobcrawler(text: string): Promise<Buffer | null> {
+  const envVars = readEnvFile(['JOBCRAWLER_ADMIN_TOKEN', 'JOBCRAWLER_BASE_URL']);
+  const token = envVars.JOBCRAWLER_ADMIN_TOKEN;
+  if (!token) return null;
+  const base = envVars.JOBCRAWLER_BASE_URL || 'http://127.0.0.1:8080';
+  try {
+    const res = await fetch(`${base}/api/admin/voice/synthesize`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/plain; charset=utf-8' },
+      body: text,
+    });
+    if (!res.ok) {
+      log.debug('Signal: jobcrawler synthesis failed', { status: res.status });
+      return null;
+    }
+    return Buffer.from(await res.arrayBuffer());
+  } catch (err) {
+    log.debug('Signal: jobcrawler synthesis request failed', { err });
+    return null;
+  }
+}
+
 async function transcribeAudioOptional(filePath: string): Promise<string | null> {
+  const viaJobcrawler = await transcribeViaJobcrawler(filePath);
+  if (viaJobcrawler) return viaJobcrawler;
+
   const whisperBin = process.env.WHISPER_BIN;
   if (whisperBin) {
     try {
@@ -550,6 +647,12 @@ export function createSignalAdapter(config: {
   let tcp: SignalTcpClient | null = null;
   let connected = false;
   const echoCache = new EchoCache();
+  // Reply-in-kind: set true whenever the most recent inbound message from a
+  // platformId was voice, consumed (deleted) by the next deliver() call so
+  // it only affects the reply to that specific voice note, not every
+  // subsequent text reply in the session. Rule added 2026-07-31: voice in,
+  // voice out; text in, text out — deterministic, not left to agent choice.
+  const lastInboundWasVoice = new Map<string, boolean>();
   let setup: ChannelSetup | null = null;
 
   // -- inbound handling --
@@ -565,6 +668,102 @@ export function createSignalAdapter(config: {
     }
   }
 
+  /**
+   * Shared voice/image attachment handling for both the Note-to-Self sync
+   * branch and the normal dataMessage branch. Previously only dataMessage
+   * had this — Note-to-Self voice notes were silently dropped entirely
+   * (early `if (!text) return`, before attachments were ever inspected) and
+   * had no attachment extraction at all even for text+voice combos. Found
+   * 2026-07-31 diagnosing why a self-recorded voice note never produced any
+   * log line, not even a routing event.
+   *
+   * `attachmentRefs` must carry base64 `data` (not a raw host `path`) —
+   * `session-manager.ts`'s `extractAttachmentFiles()` only recognizes
+   * `typeof att.data === 'string'`, writes it into the session's sandboxed
+   * inbox, and rewrites it to a container-relative `localPath`. A raw host
+   * path is invisible to that mechanism and never reaches the agent's
+   * `/workspace` — an earlier version of this fix embedded the host path in
+   * the placeholder text instead, which the agent correctly refused to read
+   * as untrusted input outside its sandbox.
+   */
+  async function buildAttachmentContent(
+    text: string,
+    attachments: SignalDataMessage['attachments'],
+    platformId: string,
+  ): Promise<{
+    content: string;
+    attachmentRefs: Array<{ data: string; name: string; contentType: string; size?: number }>;
+  }> {
+    const audioAttachment = attachments?.find((a) => a.contentType?.startsWith('audio/') && a.id);
+    const imageAttachments = attachments?.filter((a) => a.contentType?.startsWith('image/') && a.id) ?? [];
+    const hasVoice = !text && !!audioAttachment;
+
+    let content = text;
+    const attachmentRefs: Array<{ data: string; name: string; contentType: string; size?: number }> = [];
+
+    // Voice attachment — try transcription if WHISPER_BIN or OPENAI_API_KEY
+    // is configured (transcribeAudioOptional); otherwise fall back to a
+    // generic placeholder plus the raw bytes in `attachmentRefs`, so an
+    // agent with its own transcription tool (e.g. a connected MCP server's
+    // `transcribe_audio`) can pull the file from its own `/workspace` inbox.
+    if (hasVoice && audioAttachment?.id) {
+      const attachmentPath = join(config.signalDataDir, 'attachments', audioAttachment.id);
+      if (existsSync(attachmentPath)) {
+        log.info('Signal: voice attachment received', {
+          platformId,
+          attachmentId: audioAttachment.id,
+          path: attachmentPath,
+        });
+        const transcript = await transcribeAudioOptional(attachmentPath);
+        if (transcript) {
+          content = `[Voice: ${transcript}]`;
+          log.info('Signal: voice transcribed', { platformId, length: transcript.length });
+        } else {
+          content = '[Voice Message — attached]';
+        }
+        const bytes = readFileSync(attachmentPath);
+        const name = audioAttachment.filename || audioAttachment.id;
+        attachmentRefs.push({
+          data: bytes.toString('base64'),
+          name,
+          contentType: audioAttachment.contentType || 'audio/ogg',
+          size: audioAttachment.size ?? bytes.length,
+        });
+      } else {
+        log.warn('Signal: voice attachment file not found', {
+          id: audioAttachment.id,
+          path: attachmentPath,
+        });
+        content = '[Voice Message - file not found]';
+      }
+    }
+
+    // Image attachments — surface via the structured `attachments` array
+    // (base64 `data`, same as voice) so `extractAttachmentFiles` saves them
+    // into the sandboxed inbox and the agent's Read tool can reach them at
+    // `/workspace/inbox/<messageId>/<name>`. Without this, vision-capable
+    // models never see images sent over Signal.
+    for (const img of imageAttachments) {
+      const imagePath = join(config.signalDataDir, 'attachments', img.id!);
+      if (!existsSync(imagePath)) {
+        log.warn('Signal: image attachment file not found', { id: img.id, path: imagePath });
+        continue;
+      }
+      const bytes = readFileSync(imagePath);
+      const name = img.filename || img.id!;
+      const imageLine = `[Image — attached: ${name}]`;
+      content = content ? `${content}\n${imageLine}` : imageLine;
+      attachmentRefs.push({
+        data: bytes.toString('base64'),
+        name,
+        contentType: img.contentType || 'image/jpeg',
+        size: img.size ?? bytes.length,
+      });
+    }
+
+    return { content, attachmentRefs };
+  }
+
   async function handleEnvelope(envelope: SignalEnvelope): Promise<void> {
     if (!setup) return;
 
@@ -574,23 +773,38 @@ export function createSignalAdapter(config: {
       const dest = (syncSent.destinationNumber ?? syncSent.destination ?? '').trim();
       // "Note to Self" — destination is our own account
       if (dest === config.account) {
-        const text = (syncSent.message ?? '').trim();
-        if (!text) return;
+        let text = (syncSent.message ?? '').trim();
         const platformId = config.account;
-        if (echoCache.isEcho(platformId, text)) return;
+
+        const audioAttachment = syncSent.attachments?.find((a) => a.contentType?.startsWith('audio/') && a.id);
+        const imageAttachments = syncSent.attachments?.filter((a) => a.contentType?.startsWith('image/') && a.id) ?? [];
+        const hasVoice = !text && !!audioAttachment;
+        const reaction = syncSent.reaction;
+
+        // Previously `if (!text) return` — dropped every voice-only
+        // Note-to-Self message before it was ever logged. Reactions hit the
+        // same guard (empty message, no attachments) — extended below.
+        if (!text && !hasVoice && imageAttachments.length === 0 && !reaction?.emoji) return;
+        if (!text && reaction?.emoji) text = formatReactionText(reaction);
+        lastInboundWasVoice.set(platformId, hasVoice);
+
+        if (text && echoCache.isEcho(platformId, text)) return;
         const timestamp = syncSent.timestamp ? new Date(syncSent.timestamp).toISOString() : new Date().toISOString();
 
         setup.onMetadata(platformId, 'Note to Self', false);
+
+        const { content, attachmentRefs } = await buildAttachmentContent(text, syncSent.attachments, platformId);
 
         const msg: InboundMessage = {
           id: String(syncSent.timestamp ?? Date.now()),
           kind: 'chat',
           content: {
-            text,
+            text: content,
             sender: config.account,
             senderId: `signal:${config.account}`,
             senderName: 'Me',
             isFromMe: true,
+            ...(attachmentRefs.length > 0 ? { attachments: attachmentRefs } : {}),
             ...(syncSent.quote ? quoteToContent(syncSent.quote) : {}),
           },
           // Note-to-self is a DM with ourselves: same DM→mention rule.
@@ -609,13 +823,15 @@ export function createSignalAdapter(config: {
     if (!dataMessage) return;
 
     const rawText = (dataMessage.message ?? '').trim();
-    const text = rawText ? resolveMentions(rawText, dataMessage.mentions) : '';
+    let text = rawText ? resolveMentions(rawText, dataMessage.mentions) : '';
 
     const audioAttachment = dataMessage.attachments?.find((a) => a.contentType?.startsWith('audio/') && a.id);
     const imageAttachments = dataMessage.attachments?.filter((a) => a.contentType?.startsWith('image/') && a.id) ?? [];
     const hasVoice = !text && !!audioAttachment;
+    const reaction = dataMessage.reaction;
 
-    if (!text && !hasVoice && imageAttachments.length === 0) return;
+    if (!text && !hasVoice && imageAttachments.length === 0 && !reaction?.emoji) return;
+    if (!text && reaction?.emoji) text = formatReactionText(reaction);
 
     const sender = (envelope.sourceNumber ?? envelope.sourceUuid ?? envelope.source ?? '').trim();
     if (!sender) return;
@@ -630,6 +846,7 @@ export function createSignalAdapter(config: {
     const isGroup = Boolean(groupId);
 
     const platformId = isGroup ? `group:${groupId}` : sender;
+    lastInboundWasVoice.set(platformId, hasVoice);
 
     if (text && echoCache.isEcho(platformId, text)) {
       log.debug('Signal: skipping echo', { platformId });
@@ -641,46 +858,7 @@ export function createSignalAdapter(config: {
 
     setup.onMetadata(platformId, chatName, isGroup);
 
-    let content = text;
-
-    // Voice attachment — try transcription if WHISPER_BIN or OPENAI_API_KEY
-    // is configured; otherwise fall back to the original placeholder so
-    // operators who don't want transcription get the same UX as before.
-    if (hasVoice && audioAttachment?.id) {
-      const attachmentPath = join(config.signalDataDir, 'attachments', audioAttachment.id);
-      if (existsSync(attachmentPath)) {
-        log.info('Signal: voice attachment received', {
-          platformId,
-          attachmentId: audioAttachment.id,
-          path: attachmentPath,
-        });
-        const transcript = await transcribeAudioOptional(attachmentPath);
-        if (transcript) {
-          content = `[Voice: ${transcript}]`;
-          log.info('Signal: voice transcribed', { platformId, length: transcript.length });
-        } else {
-          content = '[Voice Message]';
-        }
-      } else {
-        log.warn('Signal: voice attachment file not found', {
-          id: audioAttachment.id,
-          path: attachmentPath,
-        });
-        content = '[Voice Message - file not found]';
-      }
-    }
-
-    // Image attachments — emit `[Image: <path>]` lines so the agent's Read
-    // tool can pick them up, and surface the structured `attachments` array
-    // for consumers that prefer that shape. Without this, vision-capable
-    // models never see images sent over Signal.
-    const attachmentRefs: Array<{ path: string; contentType: string }> = [];
-    for (const img of imageAttachments) {
-      const imagePath = join(config.signalDataDir, 'attachments', img.id!);
-      const imageLine = `[Image: ${imagePath}]`;
-      content = content ? `${content}\n${imageLine}` : imageLine;
-      attachmentRefs.push({ path: imagePath, contentType: img.contentType || 'image/jpeg' });
-    }
+    const { content, attachmentRefs } = await buildAttachmentContent(text, dataMessage.attachments, platformId);
 
     const msg: InboundMessage = {
       id: String(dataMessage.timestamp ?? Date.now()),
@@ -783,10 +961,18 @@ export function createSignalAdapter(config: {
     if (!connected || !tcp) return;
     if (files.length === 0) return;
 
+    // signal-cli names the delivered attachment after the BASENAME of the path
+    // it is given, so the basename must be the real filename. Uniqueness comes
+    // from a per-send temp DIRECTORY — prefixing the file itself (the previous
+    // `signal-out-<ts>-<rand>-<name>`) meant recipients saw "signal-out-1785…"
+    // instead of the document name (observed 2026-07-29).
     const tempPaths: string[] = [];
+    const tempDirs: string[] = [];
     for (const file of files) {
-      const safeName = file.filename.replace(/[/\\\0]/g, '_');
-      const tempPath = join(tmpdir(), `signal-out-${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`);
+      const safeName = file.filename.replace(/[/\\\0]/g, '_') || 'attachment';
+      const dir = mkdtempSync(join(tmpdir(), 'signal-out-'));
+      tempDirs.push(dir);
+      const tempPath = join(dir, safeName);
       writeFileSync(tempPath, file.data);
       tempPaths.push(tempPath);
     }
@@ -800,13 +986,28 @@ export function createSignalAdapter(config: {
         params.recipient = [platformId];
       }
       await tcp.rpc('send', params);
-      log.info('Signal attachments sent', { platformId, count: files.length, filenames: files.map((f) => f.filename) });
+      // Log the basenames actually handed to signal-cli: the previous version
+      // logged the *intended* filename, which hid a mismatch between what the
+      // agent asked for and what the recipient received.
+      log.info('Signal attachments sent', {
+        platformId,
+        count: files.length,
+        filenames: files.map((f) => f.filename),
+        deliveredAs: tempPaths.map((p) => p.split('/').pop()),
+      });
     } catch (err) {
       log.error('Signal: attachment send failed', { platformId, count: files.length, err });
     } finally {
       for (const p of tempPaths) {
         try {
           unlinkSync(p);
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      for (const d of tempDirs) {
+        try {
+          rmSync(d, { recursive: true, force: true });
         } catch {
           /* best-effort cleanup */
         }
@@ -927,6 +1128,23 @@ export function createSignalAdapter(config: {
       }
 
       const files = message.files ?? [];
+
+      // Reply-in-kind (rule added 2026-07-31): voice note in -> voice note
+      // out, text in -> text out. One-shot — deleting the flag here means
+      // only the reply to THIS voice note goes as audio, not every
+      // subsequent text reply in the session. Skipped when the agent's
+      // reply already carries files (e.g. a PDF link) so those aren't lost
+      // behind audio-only output; skipped on synthesis failure too — a
+      // voice-out feature must degrade to text, never drop the reply.
+      const replyWithVoice = lastInboundWasVoice.get(platformId) === true;
+      lastInboundWasVoice.delete(platformId);
+      if (replyWithVoice && text && files.length === 0) {
+        const wav = await synthesizeViaJobcrawler(text);
+        if (wav) {
+          await sendAttachments(platformId, [{ filename: 'reply.wav', data: wav }]);
+          return undefined;
+        }
+      }
 
       // Send accompanying text first so it lands above the attachment(s) in
       // the recipient's chat. Both branches no-op cleanly if their input is
