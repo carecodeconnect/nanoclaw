@@ -1,10 +1,10 @@
 /**
- * Outbound message operations (container side).
- *
- * Writes to outbound.db (container-owned).
- * The host polls this DB (read-only) for undelivered messages.
+ * Legacy runner-facing outbound API, backed by the registered mailbox.
  */
-import { getInboundDb, getOutboundDb } from './connection.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+import { getAgentMailbox } from '../mailbox/index.js';
+import type { OutboundMessage } from '../mailbox/types.js';
 
 export interface MessageOutRow {
   id: string;
@@ -33,191 +33,95 @@ export interface WriteMessageOut {
 }
 
 /**
- * Write a new outbound message, auto-assigning an odd seq number.
- * Container uses odd seq (1, 3, 5...), host uses even (2, 4, 6...).
+ * Extra entries merged into system-action payloads for the duration of a
+ * call, without the writing handler knowing about them. This is the seam
+ * `extendTool` (../mcp-tools/server.ts) uses so an installed module can
+ * add params to a base tool and have them land in the tool's outbound
+ * payload while the base tool's source stays untouched.
  *
- * The disjoint namespace is load-bearing, not just collision avoidance:
- * seq is the agent-facing message ID returned by send_message and accepted
- * by edit_message / add_reaction, and getMessageIdBySeq() below looks up
- * by seq across BOTH tables. If inbound and outbound could share a seq,
- * the agent's "edit message #5" could resolve to the wrong row.
+ * Scope is deliberately narrow: only `kind: 'system'` messages whose
+ * content parses to a JSON object are decorated, and entries never
+ * overwrite keys the handler wrote itself. Everything else passes through
+ * byte-identical. With no active context (the default), this is a no-op.
  */
-/**
- * How long an identical outbound message is treated as a duplicate.
- *
- * Sized from the observed failure: an agent delivered the same 1469-char reply
- * twice, 5.1s apart (and a 1242-char one 5.2s apart). 30s covers that with
- * margin while staying far below any plausible interval for a human
- * legitimately asking for the same text again.
- */
-const DUPLICATE_WINDOW_SECONDS = 30;
+const outboundPassthrough = new AsyncLocalStorage<Record<string, unknown>>();
 
-/**
- * Suppress an outbound message identical to one queued moments ago.
- *
- * WHY THIS EXISTS. NanoClaw has two independent ways to deliver a message and
- * nothing reconciled them:
- *
- *   1. the `send_message` MCP tool        (mcp-tools/core.ts)
- *   2. the `<message to="...">` envelope  (poll-loop.ts sendToDestination)
- *
- * Both funnel through writeMessageOut, but neither knew about the other. On
- * 2026-07-30 an agent answered a request by calling send_message AND emitting
- * the same text as an envelope, so the user received the identical message
- * twice, ~5s apart, with different ids. Telling the agent not to do that is
- * worth doing, but a prompt is not a guarantee — this is the guarantee.
- *
- * Deliberately narrow, because suppressing a message the user should have
- * received is worse than a rare duplicate:
- *   - only `chat` kind (task_log / file / system kinds are not user-facing
- *     prose and may legitimately repeat);
- *   - only immediate sends — anything with deliver_after or recurrence is a
- *     SCHEDULED message, and a recurring digest repeating its text is correct;
- *   - identical content AND identical destination (channel_type, platform_id,
- *     thread_id), compared with IS so NULLs match rather than never matching.
- *
- * Returns the existing row's seq when it suppresses, so the caller still gets a
- * usable message id for edit_message / add_reaction — those then target the
- * message that was actually delivered.
- */
-function findRecentDuplicateSeq(msg: WriteMessageOut): number | null {
-  if (msg.kind !== 'chat') return null;
-  if (msg.deliver_after || msg.recurrence) return null;
-  if (!msg.content || !msg.content.trim()) return null;
-
-  const row = getOutboundDb()
-    .prepare(
-      `SELECT seq FROM messages_out
-        WHERE kind = 'chat'
-          AND content = $content
-          AND channel_type IS $channel_type
-          AND platform_id  IS $platform_id
-          AND thread_id    IS $thread_id
-          AND datetime(timestamp) >= datetime('now', $window)
-        ORDER BY timestamp DESC
-        LIMIT 1`,
-    )
-    .get({
-      $content: msg.content,
-      $channel_type: msg.channel_type ?? null,
-      $platform_id: msg.platform_id ?? null,
-      $thread_id: msg.thread_id ?? null,
-      $window: `-${DUPLICATE_WINDOW_SECONDS} seconds`,
-    }) as { seq: number } | undefined;
-
-  return row?.seq ?? null;
+/** Run `fn` with `entries` merged into system-action payloads it writes. */
+export function withOutboundPassthrough<T>(entries: Record<string, unknown>, fn: () => T): T {
+  return outboundPassthrough.run(entries, fn);
 }
 
-export function writeMessageOut(msg: WriteMessageOut): number {
-  const outbound = getOutboundDb();
-  const inbound = getInboundDb();
+/** Apply any active passthrough entries to a system-action JSON payload. */
+function decorateContent(msg: WriteMessageOut): string {
+  const entries = outboundPassthrough.getStore();
+  if (!entries || msg.kind !== 'system') return msg.content;
 
-  // Never silently: a suppression must be visible in the container log, or a
-  // genuinely-lost message would look identical to a working system.
-  const duplicateSeq = findRecentDuplicateSeq(msg);
-  if (duplicateSeq !== null) {
-    console.warn(
-      `[messages-out] suppressed duplicate ${msg.kind} to ` +
-        `${msg.channel_type ?? '?'}:${msg.platform_id ?? '?'} ` +
-        `(${msg.content.length} chars, identical within ` +
-        `${DUPLICATE_WINDOW_SECONDS}s) — returning existing seq ${duplicateSeq}`,
-    );
-    return duplicateSeq;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(msg.content);
+  } catch {
+    return msg.content;
   }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return msg.content;
 
-  // Read max seq from both DBs to maintain global ordering.
-  // Safe: each side only reads the other DB, never writes to it.
-  const maxOut = (outbound.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_out').get() as { m: number }).m;
-  const maxIn = (inbound.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m;
-  const max = Math.max(maxOut, maxIn);
-  const nextSeq = max % 2 === 0 ? max + 1 : max + 2; // next odd
-
-  // bun:sqlite requires named parameters to be passed with the prefix character
-  // in the JS object keys (better-sqlite3 auto-stripped it, bun:sqlite does not).
-  outbound
-    .prepare(
-      `INSERT INTO messages_out (id, seq, in_reply_to, timestamp, deliver_after, recurrence, kind, platform_id, channel_type, thread_id, content)
-     VALUES ($id, $seq, $in_reply_to, $timestamp, $deliver_after, $recurrence, $kind, $platform_id, $channel_type, $thread_id, $content)`,
-    )
-    .run({
-      $id: msg.id,
-      $seq: nextSeq,
-      $timestamp: new Date().toISOString(),
-      $in_reply_to: msg.in_reply_to ?? null,
-      $deliver_after: msg.deliver_after ?? null,
-      $recurrence: msg.recurrence ?? null,
-      $kind: msg.kind,
-      $platform_id: msg.platform_id ?? null,
-      $channel_type: msg.channel_type ?? null,
-      $thread_id: msg.thread_id ?? null,
-      $content: msg.content,
-    });
-
-  return nextSeq;
+  const payload = parsed as Record<string, unknown>;
+  let changed = false;
+  for (const [key, value] of Object.entries(entries)) {
+    if (!Object.prototype.hasOwnProperty.call(payload, key)) {
+      payload[key] = value;
+      changed = true;
+    }
+  }
+  return changed ? JSON.stringify(payload) : msg.content;
 }
 
-/**
- * Look up a message's platform ID by seq number.
- * Searches both inbound and outbound DBs since seq spans both.
- *
- * For inbound messages, the Chat SDK message ID is already the platform message ID
- * (e.g., "6037840640:42" for Telegram).
- *
- * For outbound messages, the internal ID (msg-xxx) won't work for edits/reactions.
- * Instead, look up the platform_message_id from the delivered table (host writes this
- * after successful delivery).
- */
+function messageRow(message: OutboundMessage): MessageOutRow {
+  return {
+    id: message.id,
+    seq: message.sequence,
+    in_reply_to: message.inReplyTo,
+    timestamp: message.timestamp,
+    deliver_after: message.deliverAfter,
+    recurrence: message.recurrence,
+    kind: message.kind,
+    platform_id: message.platformId,
+    channel_type: message.channelType,
+    thread_id: message.threadId,
+    content: message.content,
+  };
+}
+
+export function writeMessageOut(msg: WriteMessageOut): Promise<number> {
+  return getAgentMailbox().operations.writeMessageOut({
+    id: msg.id,
+    inReplyTo: msg.in_reply_to,
+    deliverAfter: msg.deliver_after,
+    recurrence: msg.recurrence,
+    kind: msg.kind,
+    platformId: msg.platform_id,
+    channelType: msg.channel_type,
+    threadId: msg.thread_id,
+    content: decorateContent(msg),
+  });
+}
+
 export function getMessageIdBySeq(seq: number): string | null {
-  const inbound = getInboundDb();
-
-  // Inbound messages: ID is already the platform message ID
-  const inRow = inbound.prepare('SELECT id FROM messages_in WHERE seq = ?').get(seq) as
-    | { id: string }
-    | undefined;
-  if (inRow) return inRow.id;
-
-  // Outbound messages: look up platform message ID from delivered table
-  const outRow = getOutboundDb().prepare('SELECT id FROM messages_out WHERE seq = ?').get(seq) as
-    | { id: string }
-    | undefined;
-  if (!outRow) return null;
-
-  // Check if host has stored the platform message ID after delivery
-  const deliveredRow = inbound
-    .prepare('SELECT platform_message_id FROM delivered WHERE message_out_id = ?')
-    .get(outRow.id) as { platform_message_id: string | null } | undefined;
-  if (deliveredRow?.platform_message_id) return deliveredRow.platform_message_id;
-
-  // Fallback to internal ID (edits/reactions on undelivered messages won't work)
-  return outRow.id;
+  return getAgentMailbox().operations.getMessageIdBySeq(seq);
 }
 
-/**
- * Look up the routing fields for a message by seq (for edit/reaction targeting).
- * Returns the channel_type, platform_id, thread_id of the referenced message.
- */
 export function getRoutingBySeq(
   seq: number,
 ): { channel_type: string | null; platform_id: string | null; thread_id: string | null } | null {
-  const inbound = getInboundDb();
-  const inRow = inbound
-    .prepare('SELECT channel_type, platform_id, thread_id FROM messages_in WHERE seq = ?')
-    .get(seq) as { channel_type: string | null; platform_id: string | null; thread_id: string | null } | undefined;
-  if (inRow) return inRow;
-
-  const outRow = getOutboundDb()
-    .prepare('SELECT channel_type, platform_id, thread_id FROM messages_out WHERE seq = ?')
-    .get(seq) as { channel_type: string | null; platform_id: string | null; thread_id: string | null } | undefined;
-  return outRow ?? null;
+  const routing = getAgentMailbox().operations.getRoutingBySeq(seq);
+  return (
+    routing && {
+      channel_type: routing.channelType,
+      platform_id: routing.platformId,
+      thread_id: routing.threadId,
+    }
+  );
 }
 
-/** Get undelivered messages (for host polling — reads from outbound.db). */
 export function getUndeliveredMessages(): MessageOutRow[] {
-  return getOutboundDb()
-    .prepare(
-      `SELECT * FROM messages_out
-       WHERE (deliver_after IS NULL OR datetime(deliver_after) <= datetime('now'))
-       ORDER BY timestamp ASC`,
-    )
-    .all() as MessageOutRow[];
+  return getAgentMailbox().operations.getUndeliveredMessages().map(messageRow);
 }

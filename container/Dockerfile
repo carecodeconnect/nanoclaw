@@ -1,10 +1,16 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# The BuildKit frontend above is pinned by digest, so a build fetches it by
+# content address and never asks Docker Hub to resolve the `1.7` tag first. The
+# tag lookup is the HEAD request that returned 500 and took two registry-skills
+# legs down on 2026-09-07 with the code untouched. Resolved with
+# `crane digest docker/dockerfile:1.7` (docker buildx imagetools inspect agrees).
+# Bump the tag and digest together.
 # NanoClaw Agent Container
 # Runs Claude Agent SDK in isolated Linux VM with browser automation.
 #
 # Runtime split:
 #   - agent-runner (our TypeScript code): Bun, mounted RO at /app/src by host
-#   - globally-installed Node CLIs (claude-code, agent-browser, vercel): pnpm + Node
+#   - globally-installed Node CLIs (claude-code, agent-browser): pnpm + Node
 #
 # Source is never baked in — /app/src is provided by a shared read-only
 # bind mount at runtime (see src/container-runner.ts). Source-only changes
@@ -18,10 +24,10 @@ ARG INSTALL_CJK_FONTS=false
 
 # Pin versions for reproducibility. Bump deliberately — unpinned installs mean
 # every rebuild silently picks up the latest and can break in lockstep across
-# all users. The global Node CLIs (claude-code, agent-browser, vercel) are
+# all users. The global Node CLIs (claude-code, agent-browser) are
 # pinned in cli-tools.json so a skill can add one with a json-merge; Bun (the
 # runtime) is pinned here because it installs from a different source.
-ARG BUN_VERSION=1.3.12
+ARG BUN_VERSION=1.4.0
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -34,6 +40,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         fonts-noto-color-emoji \
         libgbm1 \
         libnss3 \
+        libnss3-tools \
         libatk-bridge2.0-0 \
         libgtk-3-0 \
         libx11-xcb1 \
@@ -95,8 +102,15 @@ ENV PATH="$PNPM_HOME:$PATH"
 # silently skips claude-code's native-binary postinstall and agent-browser's
 # bin chmod — the agent then crashes at runtime with "native binary not
 # installed". Keep this in lockstep with package.json's `packageManager`.
-ARG PNPM_VERSION=10.33.0
+ARG PNPM_VERSION=10.34.5
 RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
+
+# The npm bundled with node:22-slim (10.9.8) vendors tar <7.5.19, which
+# carries a fixable critical (GHSA-23hp-3jrh-7fpw) that the publish gate
+# refuses to ship. Patch-level bump only. Drop this once the base image
+# ships npm >= 10.9.9.
+ARG NPM_VERSION=10.9.9
+RUN npm install -g npm@${NPM_VERSION}
 
 # Global Node CLIs the agent invokes at runtime live in cli-tools.json so a
 # skill can add one with a json-merge instead of editing this Dockerfile.
